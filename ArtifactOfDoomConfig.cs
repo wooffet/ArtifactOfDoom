@@ -1,5 +1,6 @@
 ﻿using BepInEx;
 using BepInEx.Configuration;
+using MiniRpcLib;
 using R2API;
 using R2API.Utils;
 using RoR2;
@@ -38,7 +39,7 @@ namespace ArtifactOfDoom
         public static ConfigEntry<string> CustomChars;
 
         public static ConfigEntry<bool> useArtifactOfSacrificeCalculation;
-        public static ConfigEntry<double> multiplayerForArtifactOfSacrificeDropRate;
+        public static ConfigEntry<double> multiplierForArtifactOfSacrificeDropRate;
 
         public static ConfigEntry<bool> disableItemProgressBar;
 
@@ -111,8 +112,8 @@ namespace ArtifactOfDoom
                 "Enable the nerf for Artifact of Swarm where you've to kill double as many enemies"));
 
             useArtifactOfSacrificeCalculation = cfgFile.Bind(new ConfigDefinition("Gameplay Settings", "useArtifactOfSacreficeCalculation"), false, new ConfigDescription(
-                "Chance the item gain to a specific drop rate of enemys"));
-            multiplayerForArtifactOfSacrificeDropRate = cfgFile.Bind(new ConfigDefinition("Gameplay Settings", "multiplayerForArtifactOfSacrificeDropRate"), 2.0, new ConfigDescription(
+                "Change the item gain to a specific drop rate of enemys"));
+            multiplierForArtifactOfSacrificeDropRate = cfgFile.Bind(new ConfigDefinition("Gameplay Settings", "multiplierForArtifactOfSacrificeDropRate"), 2.0, new ConfigDescription(
                 "Multiplier for the drop rate (base Chance is 5)"));
 
             disableItemProgressBar = cfgFile.Bind(new ConfigDefinition("UI Settings", "disableItemProgressBar"), false, new ConfigDescription(

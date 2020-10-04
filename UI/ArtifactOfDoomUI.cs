@@ -1,3 +1,5 @@
+using ArtifactOfDoom.Artifacts.Contracts;
+using ArtifactOfDoom.Ui.Contracts;
 using BepInEx;
 using MiniRpcLib;
 using MiniRpcLib.Func;
@@ -19,7 +21,6 @@ using UnityEngine.UI;
 
 namespace ArtifactOfDoom
 {
-
     [R2API.Utils.R2APISubmoduleDependency("ResourcesAPI")]
     [BepInPlugin("com.ohway.UIMod", "UI Modifier", "1.0")]
     [BepInDependency(MiniRpcPlugin.Dependency)]
@@ -30,9 +31,7 @@ namespace ArtifactOfDoom
         private static bool calculationSacrifice = false;
         void Awake()
         {
-            //On.RoR2.UI.HealthBar.Awake += ExpBarAwakeAddon;
             On.RoR2.UI.HUD.Awake += HUDAwake;
-
 
             try
             {
@@ -42,11 +41,6 @@ namespace ArtifactOfDoom
             {
                 Debug.LogError($"[SirHamburger] Error in SetUpMiniRPC");
             }
-            On.RoR2.Inventory.RemoveItem += (orig, self, itemindex1, ItemIndex2) =>
-            {
-                orig(self, itemindex1, ItemIndex2);
-
-            };
         }
         private void SetUpModCanvas()
         {
@@ -66,7 +60,6 @@ namespace ArtifactOfDoom
                 ModCanvas.GetComponent<CanvasScaler>().screenMatchMode = CanvasScaler.ScreenMatchMode.Expand;
             }
         }
-
 
         #region Exp bar GameObjects
         public Transform HUDRoot = null;
@@ -187,24 +180,13 @@ namespace ArtifactOfDoom
             }
 
         }
-        public static void updateItemProgressBar(int enemiesKilled, int enemiesNeeded)
-        {
 
+        public static IRpcFunc<UpdatePlayerItemsRequest, RpcResult> UpdatePlayerItems { get; set; }
+        public static IRpcFunc<UpdateProgressBarRequest, RpcResult> UpdateProgressBar { get; set; }
+        public static IRpcFunc<bool, RpcResult> IsArtifactActive { get; set; }
+        public static IRpcFunc<bool, RpcResult> IsCalculationSacrifice { get; set; }
 
-        }
-
-
-
-        public static IRpcFunc<string, string> AddGainedItemsToPlayers { get; set; }
-        public static IRpcFunc<string, string> AddLostItemsOfPlayers { get; set; }
-        public static IRpcFunc<string, string> UpdateProgressBar { get; set; }
-        public static IRpcFunc<bool, string> IsArtifactActive { get; set; }
-        public static IRpcFunc<bool, string> IsCalculationSacrifice { get; set; }
-
-        public const string ModVer = "1.2.0";
-        public const string ModName = "ArtifactOfDoom";
         public const string ModGuid = "com.SirHamburger.ArtifactOfDoom";
-
         private void SetUpMiniRPC()
         {
             // Fix the damn in-game console stealing our not-in-game consoles output.
@@ -217,130 +199,144 @@ namespace ArtifactOfDoom
             // I opted for the ModGuid instead of an arbitrary number or GUID to encourage mods not to set the same ID
             var miniRpc = MiniRpc.CreateInstance(ModGuid);
 
-            AddGainedItemsToPlayers = miniRpc.RegisterFunc(Target.Client, (NetworkUser user, string QueueGainedItemSpriteToString) => //--------------------HierSTuffMachen!!
+            UpdatePlayerItems = miniRpc.RegisterFunc(Target.Client, (NetworkUser user, UpdatePlayerItemsRequest request) => //--------------------HierSTuffMachen!!
             {
-                if (!ArtifactOfDoomConfig.disableSideBars.Value)
+                var result = new RpcResult();
+                try
                 {
-                    string[] QueueGainedItemSprite = QueueGainedItemSpriteToString.Split(' ');
+                    if (ArtifactOfDoomConfig.disableSideBars.Value)
+                    {
+                        result.Success = false;
+                        result.Message = "Artifact of Doom sidebars are disabled, cannot display player item change";
+                        result.Severity = LogSeverity.Warning;
+                        return result;
+                    }
 
                     int i = 0;
-                    foreach (var element in QueueGainedItemSprite)
+                    foreach (var itemName in request.ItemNames)
                     {
-                        if (element != "")
+                        if (string.IsNullOrEmpty(itemName))
                         {
-
-                            if (ArtifactOfDoomUI.listGainedImages[i].GetComponent<Image>() == null)
-                                ArtifactOfDoomUI.listGainedImages[i].AddComponent<Image>();
-                            ArtifactOfDoomUI.listGainedImages[i].GetComponent<Image>().sprite = ItemCatalog.GetItemDef(ItemCatalog.FindItemIndex(element)).pickupIconSprite;
-
-                            i++;
-
+                            continue;
                         }
 
+                        if (request.ChangeAction == ItemChangeAction.Gain)
+                        {
+                            if (listGainedImages[i].GetComponent<Image>() == null)
+                            {
+                                listGainedImages[i].AddComponent<Image>();
+                            }
+
+                            listGainedImages[i].GetComponent<Image>().sprite = ItemCatalog.GetItemDef(ItemCatalog.FindItemIndex(itemName)).pickupIconSprite;
+                        }
+                        else if (request.ChangeAction == ItemChangeAction.Loss)
+                        {
+                            if (listLostImages[i].GetComponent<Image>() == null)
+                            {
+                                listLostImages[i].AddComponent<Image>();
+                            }
+                            listLostImages[i].GetComponent<Image>().sprite = ItemCatalog.GetItemDef(ItemCatalog.FindItemIndex(itemName)).pickupIconSprite;
+                        }
+
+                        i++;
+
+                        result.Success = true;
                     }
                 }
-                return "dummie";
-            });
-            AddLostItemsOfPlayers = miniRpc.RegisterFunc(Target.Client, (NetworkUser user, string QueueLostItemSpriteToString) => //--------------------HierSTuffMachen!!
-            {
-                if (!ArtifactOfDoomConfig.disableSideBars.Value)
+                catch (Exception e)
                 {
-                    string[] QueueLostItemSprite = QueueLostItemSpriteToString.Split(' ');
-
-                    int i = 0;
-                    foreach (var element in QueueLostItemSprite)
-                    {
-                        if (element != "")
-                        {
-
-                            if (ArtifactOfDoomUI.listLostImages[i].GetComponent<Image>() == null)
-                                ArtifactOfDoomUI.listLostImages[i].AddComponent<Image>();
-                            ArtifactOfDoomUI.listLostImages[i].GetComponent<Image>().sprite = ItemCatalog.GetItemDef(ItemCatalog.FindItemIndex(element)).pickupIconSprite;
-
-                            i++;
-                        }
-
-                    }
+                    result.Success = false;
+                    result.Message = $"Error updating player items! {e}";
+                    result.Severity = LogSeverity.Error;
                 }
-                return "dummie";
+
+                return result;
             });
-            UpdateProgressBar = miniRpc.RegisterFunc(Target.Client, (NetworkUser user, string killedNeededEnemies) => //--------------------HierSTuffMachen!!
+
+            UpdateProgressBar = miniRpc.RegisterFunc(Target.Client, (NetworkUser user, UpdateProgressBarRequest request) => //--------------------HierSTuffMachen!!
             {
-                //Debug.LogWarning("in UpdateProgressBar");
-                //Debug.LogError("ArtifactOfDoomConfig.disableItemProgressBar.Value"+ ArtifactOfDoomConfig.disableItemProgressBar.Value);
-                //Debug.LogError("ArtifactOfDoomConfig.useArtifactOfSacreficeCalculation.Value"+ ArtifactOfDoomConfig.useArtifactOfSacreficeCalculation.Value);
+                var result = new RpcResult();
                 if (ArtifactOfDoomConfig.disableItemProgressBar.Value || calculationSacrifice)
-                    return "Disabled Progress Bar";
-
-                if (killedNeededEnemies == null)
                 {
-                    Debug.Log("killedNeededEnemies == null");
-                    return "error";
+                    result.Message = "Progress Bar is disabled";
+                    result.Severity = LogSeverity.Warning;
+                    return result;
                 }
 
-                //Debug.LogWarning("string killedNeededEnemies für rpc: " + killedNeededEnemies);
-                string[] stringkilledNeededEnemies = killedNeededEnemies.Split(',');
-                //Debug.LogError("in line 276");
-                if (stringkilledNeededEnemies == null)
-                    Debug.LogError("stringkilledneededEnemies=null");
+                if (request == null)
+                {
+                    result.Message = "UpdateProgressBarRequest is null!";
+                    result.Severity = LogSeverity.Error;
+                    return result;
+                }
+                
+                if (request.TriggerAmount <= 0)
+                {
+                    result.Message = "UpdateProgressBarRequest TriggerAmount is not valid!";
+                    result.Severity = LogSeverity.Error;
+                    return result;
+                }
 
-                int enemiesKilled = Convert.ToInt32(stringkilledNeededEnemies[0]);
-                int enemiesNeeded = Convert.ToInt32(stringkilledNeededEnemies[1]) + 2;
-
-                //Debug.LogError("in line 279");
                 if (itemGainBar == null)
-                    return "error";
-                double progress = (double)enemiesKilled / ((double)enemiesNeeded);
+                {
+                    result.Message = "itemGainBar has not been initialised by UI!";
+                    result.Severity = LogSeverity.Error;
+                    return result;
+                }
 
-                //                  Debug.LogError("in line 2282");
+                double progress = (double)request.EnemiesKilled / request.TriggerAmount;
+
                 if (itemGainBar.GetComponent<RectTransform>() == null)
-                    return "Error while excecuting Update progress bar";
+                {
+                    result.Message = "itemGainBar RectTransform Get failed!";
+                    result.Severity = LogSeverity.Error;
+                    return result;
+                }
+
+                if (itemGainBar.GetComponent<RectTransform>().anchorMax == null || itemGainBar.GetComponent<RectTransform>().anchorMax == null)
+                {
+                    result.Message = "itemGainBar RectTransform properties have not been initialised!";
+                    result.Severity = LogSeverity.Error;
+                    return result;
+                }
 
                 if ((0.35f + (float)(progress * 0.3)) > 0.65f)
                 {
-
-                    if (itemGainBar.GetComponent<RectTransform>().anchorMax == null)
-                        Debug.LogError("itemGainBar.GetComponent<RectTransform>().anchorMax==null");
-
                     itemGainBar.GetComponent<RectTransform>().anchorMax = new Vector2(0.65f, 0.06f);
                 }
                 else
                 {
-
                     itemGainBar.GetComponent<RectTransform>().anchorMin = new Vector2(0.35f, 0.05f);
-                    //                    Debug.LogError("in line 288");
 
                     itemGainBar.GetComponent<RectTransform>().anchorMax = new Vector2(0.35f + (float)(progress * 0.3), 0.06f);
                 }
-                return "dummie";
+
+                result.Success = true;
+                return result;
             });
+
             IsArtifactActive = miniRpc.RegisterFunc(Target.Client, (NetworkUser user, bool isActive) => //--------------------HierSTuffMachen!!
             {
                 ArtifactIsActive = isActive;
-                return "";
+                var result = new RpcResult(true, "UI aware Artifact of Doom is active!", LogSeverity.Info);
+
+                return result;
             });
+
             IsCalculationSacrifice = miniRpc.RegisterFunc(Target.Client, (NetworkUser user, bool isActive) => //--------------------HierSTuffMachen!!
             {
-                //Debug.LogError("Set CalculationSacrifice to " + isActive);
                 calculationSacrifice = isActive;
-                return "";
+                var result = new RpcResult(true, "UI aware Artifact of Sacrifice calculation is in use!", LogSeverity.Info);
+
+                return result;
             });
 
             Debug.LogWarning("minirpc succsessfull set up");
-
-            // The "_ ="'s above mean that the return value will be ignored. In your code you should assign the return value to something to be able to call the function.
-        }
-        enum CommandId
-        {
-            //                     ----|    This number is only needed because we already created an RpcFunc with ID 0 (the first one we made without an ID).
-            SomeCommandName = 2345, // If you use IDs in your own code, you will most likely want to give all commands explicit IDs, which will avoid this issue.
-            SomeOtherCommandName,
         }
 
         private void OnDestroy()
         {
             On.RoR2.UI.HUD.Awake -= HUDAwake;
-           // On.RoR2.Inventory.RemoveItem -= RemoveItem;
         }
     }
 }

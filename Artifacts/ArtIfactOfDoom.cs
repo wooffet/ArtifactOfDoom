@@ -1,4 +1,6 @@
 ﻿
+using ArtifactOfDoom.Artifacts.Contracts;
+using ArtifactOfDoom.Ui.Contracts;
 using R2API;
 using RoR2;
 using RoR2.Stats;
@@ -21,9 +23,9 @@ namespace ArtifactOfDoom
 
         protected override string NewLangName(string langid = null) => displayName;
         protected override string NewLangDesc(string langid = null) => "You get items on enemy kills but lose items every time you take damage.";
-        private static List<CharacterBody> _playerNames = new List<CharacterBody>();
-        private static List<int> _counters = new List<int>();
-        private int _currentStage = 0;
+        private static List<CharacterBody> _playerNames;
+        private static List<double> _counters;
+        private int _currentStage;
 
         private Dictionary<NetworkUser, bool> _lockNetworkUser = new Dictionary<NetworkUser, bool>();
         private Dictionary<NetworkUser, bool> _lockItemGainNetworkUser = new Dictionary<NetworkUser, bool>();
@@ -35,6 +37,8 @@ namespace ArtifactOfDoom
         public static Dictionary<uint, Queue<ItemDef>> QueueGainedItemSprite = new Dictionary<uint, Queue<ItemDef>>();
 
         private static double _timeForBuff = 0.0;
+
+        private static readonly float _baseDropChance = 5f * (float)ArtifactOfDoomConfig.multiplierForArtifactOfSacrificeDropRate.Value;
 
         public ArtifactOfDoom()
         {
@@ -54,7 +58,7 @@ namespace ArtifactOfDoom
         protected override void LoadBehavior()
         {
             _playerNames = new List<CharacterBody>();
-            _counters = new List<int>();
+            _counters = new List<double>();
             _currentStage = 0;
 
             _statsLostItems = null;
@@ -63,7 +67,11 @@ namespace ArtifactOfDoom
             _statsLostItems = StatDef.Register("Lostitems", StatRecordType.Sum, StatDataType.ULong, 0, null);
             _statsGainItems = StatDef.Register("Gainitems", StatRecordType.Sum, StatDataType.ULong, 0, null);
 
-            // TODO: These register methods can be moved into a RegisterEvents method
+            RegisterGameEvents();
+        }
+
+        private void RegisterGameEvents()
+        {
             RegisterGameEndReportPanelControllerAwakeEvent();
             RegisterSceneDirectorPopulateSceneEvent();
             RegisterRunStartEvent();
@@ -71,6 +79,198 @@ namespace ArtifactOfDoom
             RegisterGlobalEventManagerOnCharacterDeathEvent();
             RegisterHealthComponentTakeDamageEvent();
         }
+
+        private void RegisterGameEndReportPanelControllerAwakeEvent()
+        {
+            On.RoR2.UI.GameEndReportPanelController.Awake += (orig, self) =>
+            {
+                orig(self);
+                if (!IsActiveAndEnabled())
+                {
+                    return;
+                }
+                string[] information = new string[self.statsToDisplay.Length + 2];
+                self.statsToDisplay.CopyTo(information, 0);
+                information[information.Length - 2] = "Lostitems";
+                information[information.Length - 1] = "Gainitems";
+                self.statsToDisplay = information;
+            };
+        }
+
+        private void RegisterSceneDirectorPopulateSceneEvent()
+        {
+            On.RoR2.SceneDirector.PopulateScene += (orig, self) =>
+            {
+                orig(self);
+                _currentStage = Run.instance.stageClearCount + 1;
+
+                switch (Run.instance.selectedDifficulty)
+                {
+                    case DifficultyIndex.Easy:
+                        _timeForBuff = ArtifactOfDoomConfig.timeAfterHitToNotLoseItemDrizzly.Value;
+                        break;
+                    case DifficultyIndex.Normal:
+                        _timeForBuff = ArtifactOfDoomConfig.timeAfterHitToNotLoseItemRainstorm.Value;
+                        break;
+                    case DifficultyIndex.Hard:
+                        _timeForBuff = ArtifactOfDoomConfig.timeAfterHitToNotLoseItemMonsoon.Value;
+                        break;
+                    default:
+                        break;
+                }
+                    
+                QueueLostItemSprite = new Dictionary<uint, Queue<ItemDef>>();
+                QueueGainedItemSprite = new Dictionary<uint, Queue<ItemDef>>();
+                _playerNames = new List<CharacterBody>();
+                _counters = new List<double>();
+                _lockNetworkUser.Clear();
+            };
+        }
+
+        private void RegisterRunStartEvent()
+        {
+            On.RoR2.Run.Start += (orig, self) =>
+            {
+                orig(self);
+
+                ArtifactOfDoomUI.IsArtifactActive.Invoke(IsActiveAndEnabled(), result =>
+                {
+                    HandleRpcResult(result);
+                });
+
+                ArtifactOfDoomUI.IsCalculationSacrifice.Invoke(ArtifactOfDoomConfig.useArtifactOfSacrificeCalculation.Value, result =>
+                {
+                    HandleRpcResult(result);
+                });
+            };
+        }
+
+        private void RegisterCharacterBodyOnInventoryChangedEvent()
+        {
+            On.RoR2.CharacterBody.OnInventoryChanged += (orig, self) =>
+            {
+                orig(self);
+                try
+                {
+                    if (!IsActiveAndEnabled() || !self.isPlayerControlled)
+                    {
+                        return;
+                    }
+
+                    double enemyCountToTrigger = CalculateEnemyCountToTrigger(self.inventory);
+                    AddCharacterBodyToPlayerNamesList(self);
+
+                    NetworkUser networkUser = GetNetworkUserOfCharacterBody(self);
+                    if (!_lockNetworkUser.ContainsKey(networkUser))
+                    {
+                        _lockNetworkUser.Add(networkUser, false);
+                    }
+
+                    if (_lockNetworkUser[networkUser] == false)
+                    {
+                        _lockNetworkUser[networkUser] = true;
+                        var request = new UpdateProgressBarRequest(_counters[_playerNames.IndexOf(self)], enemyCountToTrigger);
+                        ArtifactOfDoomUI.UpdateProgressBar.Invoke(request, result =>
+                        {
+                            HandleRpcResult(result);
+
+                            _lockNetworkUser[networkUser] = false;
+                        }, networkUser);
+                    }
+                }
+                catch (Exception e)
+                {
+                    LogErrorMessage($"Error while inventory changed: \n{e}");
+                }
+            };
+        }        
+
+        private void RegisterGlobalEventManagerOnCharacterDeathEvent()
+        {
+            On.RoR2.GlobalEventManager.OnCharacterDeath += (orig, self, damageReport) =>
+            {
+                orig(self, damageReport);
+
+                CharacterBody currentBody;
+                if (damageReport.attackerOwnerMaster != null)
+                {
+                    currentBody = damageReport.attackerOwnerMaster.GetBody();
+                }
+                else
+                {
+                    currentBody = damageReport.attackerBody;
+                }
+
+                if (!IsActiveAndEnabled() || Run.instance.isGameOverServer || damageReport.victimBody.isPlayerControlled || damageReport.attackerBody == null
+                    || damageReport.attackerBody.inventory == null || damageReport.victimBody.inventory == null || !currentBody.isPlayerControlled)
+                {
+                    return;
+                }
+
+                if (damageReport.attackerOwnerMaster != null)
+                {
+                    AddCharacterBodyToPlayerNamesList(damageReport.attackerOwnerMaster.GetBody());
+                }
+                else
+                {
+                    AddCharacterBodyToPlayerNamesList(damageReport.attackerBody);
+                }
+
+                uint pos = 0;
+
+                double enemyCountToTrigger = CalculateEnemyCountToTrigger(currentBody.inventory);
+
+                // TODO: Would be good to extract this if condition out into it's own local variable/own method with a name that describes what it is actually checking for
+                if (_counters[_playerNames.IndexOf(currentBody)] <= enemyCountToTrigger && !ArtifactOfDoomConfig.useArtifactOfSacrificeCalculation.Value)
+                {
+                    SendUpdateProgressBarRequest(damageReport, currentBody, enemyCountToTrigger);
+                }
+                else
+                {
+                    // This was changed to give an item if the Artifact Of Sacrifice is enabled
+                    // Before this seemed like it wanted to do that, but was instead giving an item if attackerOwnerMaster got a kill and Sacrifice WOULD NOT have given an item
+                    var isUsingArtifactOfSacrifice = damageReport.attackerOwnerMaster != null && ArtifactOfDoomConfig.useArtifactOfSacrificeCalculation.Value && IsItemGivenFromArtifactOfSacrifice(damageReport);
+
+                    double chanceToTrigger = isUsingArtifactOfSacrifice ? GetCharacterSpecificBuffLengthMultiplier(currentBody.baseNameToken) * 100
+                                                                        : GetCharacterSpecificItemCount(currentBody.baseNameToken) * 100;
+                    var rand = new Random();
+                    while (chanceToTrigger > rand.Next(0, 99))
+                    {
+                        ItemIndex addedItem = GetRandomItem();
+                        currentBody.inventory.GiveItem(addedItem);
+
+                        if (ArtifactOfDoomConfig.enableChatItemOutput.Value)
+                        {
+                            SendItemChatMessage(currentBody, addedItem, ItemChangeAction.Gain);
+                        }
+
+                        PlayerStatsComponent.FindBodyStatSheet(currentBody).PushStatValue(_statsGainItems, 1UL);
+
+                        if (!QueueGainedItemSprite.ContainsKey(currentBody.netId.Value))
+                        {
+                            QueueGainedItemSprite.Add(currentBody.netId.Value, new Queue<ItemDef>());
+                        }
+
+                        pos = currentBody.netId.Value;
+                        QueueGainedItemSprite[pos].Enqueue(ItemCatalog.GetItemDef(addedItem));
+                        chanceToTrigger -= 100;
+                    }
+
+                    _counters[_playerNames.IndexOf(currentBody)]++;
+
+                    if (QueueGainedItemSprite[pos].Count > 10)
+                    {
+                        QueueGainedItemSprite[pos].Dequeue();
+                    }
+
+                    SendPlayerItemGainRequest(damageReport, pos, isUsingArtifactOfSacrifice);
+
+                    SendUpdateProgressBarRequest(damageReport, currentBody, chanceToTrigger);
+
+                    _counters[_playerNames.IndexOf(currentBody)] = 0;
+                }
+            };
+        }        
 
         private void RegisterHealthComponentTakeDamageEvent()
         {
@@ -89,11 +289,13 @@ namespace ArtifactOfDoom
 
                 LogWarningMessage();
 
-                int totalItems = getTotalItemCountOfPlayer(self.body.inventory);
+                int totalItems = GetTotalItemCountOfPlayer(self.body.inventory);
                 if (self.body.isPlayerControlled && (totalItems > 0) && self.name != damageinfo.attacker.name)
                 {
                     Dictionary<ItemIndex, int> itemIndexDict = new Dictionary<ItemIndex, int>();
                     List<ItemIndex> itemIndexes = new List<ItemIndex>();
+
+                    // TODO: Is there a way to add to a collection of items on pickup/loss? Would save having to iterate through all item types to find which ones are currently in the inventory
                     foreach (var element in ItemCatalog.allItems)
                     {
                         if (self.body.inventory.GetItemCount(element) > 0)
@@ -127,8 +329,6 @@ namespace ArtifactOfDoom
                         chanceToTrigger *= 100;
                     }
 
-                    int lostItems = 0;
-
                     uint pos = 50000;
 
                     while (chanceToTrigger > 0)
@@ -145,7 +345,6 @@ namespace ArtifactOfDoom
                             break;
                         }
 
-                        lostItems++;
                         int randomPosition = rand.Next(0, itemIndexDict.Count - 1);
                         ItemIndex itemToRemove = itemIndexes[randomPosition];
                         while ((itemIndexDict[itemToRemove] == 0))
@@ -160,19 +359,9 @@ namespace ArtifactOfDoom
                         {
                             self.body.inventory.RemoveItem(itemToRemove, 1);
 
-                            // TODO: Move this duplicated logic into own method
                             if (ArtifactOfDoomConfig.enableChatItemOutput.Value)
                             {
-                                var pickupDef = ItemCatalog.GetItemDef(itemToRemove);
-                                var pickupName = Language.GetString(pickupDef.nameToken);
-                                var playerColor = self.body.GetColoredUserName();
-                                var itemCount = self.body.inventory.GetItemCount(pickupDef.itemIndex);
-                                Chat.SendBroadcastChat(new Chat.SimpleChatMessage
-                                {
-                                    baseToken =
-                                    self.body.GetColoredUserName() + $"<color=#{_grayColor}> lost</color> " +
-                                    $"{pickupName ?? "???"} ({itemCount})</color> <color=#{_grayColor}></color>"
-                                });
+                                SendItemChatMessage(self.body, itemToRemove, ItemChangeAction.Loss);
                             }
 
                             PlayerStatsComponent.FindBodyStatSheet(self.body).PushStatValue(_statsLostItems, 1UL);
@@ -183,51 +372,18 @@ namespace ArtifactOfDoom
                                 QueueLostItemSprite[pos].Dequeue();
                             }
 
-                            double buffLengthMultiplier = getCharacterSpecificBuffLengthMultiplier(self.body.baseNameToken);
+                            double buffLengthMultiplier = GetCharacterSpecificBuffLengthMultiplier(self.body.baseNameToken);
                             self.body.AddTimedBuff(ArtifactOfDoomConfig.buffIndexDidLoseItem, (float)(_timeForBuff * (float)buffLengthMultiplier));
                         }
 
                         chanceToTrigger -= 100;
                     }
 
-                    NetworkUser tempNetworkUser = getNetworkUserOfCharacterBody(self.body);
-
-                    if (tempNetworkUser == null)
-                    {
-                        LogErrorMessage("--------------------------------tempNetworkUser(lostitems)==null---------------------------");
-                    }
-
-                    if (!_lockNetworkUser.ContainsKey(tempNetworkUser))
-                    {
-                        _lockNetworkUser.Add(tempNetworkUser, false);
-                    }
-
-                    //TODO: Use class insead of temp string
-                    string temp = "";
-                    foreach (var element in QueueLostItemSprite[pos])
-                    {
-                        temp += element.name + " ";
-                    }
-                    
-                    if (_lockNetworkUser[tempNetworkUser] == false)
-                    {
-                        _lockNetworkUser[tempNetworkUser] = true;
-                        ArtifactOfDoomUI.AddLostItemsOfPlayers.Invoke(temp, result =>
-                        {
-                            _lockNetworkUser[tempNetworkUser] = false;
-                        }, tempNetworkUser);
-
-                        //TODO: Use class insead of temp string
-                        int enemyCountToTrigger = calculateEnemyCountToTrigger(self.body.inventory);
-                        string tempString = _counters[_playerNames.IndexOf(self.body)] + "," + enemyCountToTrigger;
-                        ArtifactOfDoomUI.UpdateProgressBar.Invoke(tempString, result =>
-                        {
-                        }, tempNetworkUser);
-                    }
+                    SendPlayerItemLossRequest(self.body, pos);
                 }
             };
         }
-
+        
         private static void LogTakeDamageEventWarningMessages(CharacterBody body, bool isGameOverServer, DamageInfo damageinfo)
         {
             if (body == null)
@@ -276,278 +432,153 @@ namespace ArtifactOfDoom
             UnityEngine.Debug.LogWarning(warning);
         }
 
-        private void RegisterGlobalEventManagerOnCharacterDeathEvent()
+        private static void LogInfoMessage(string message)
         {
-            On.RoR2.GlobalEventManager.OnCharacterDeath += (orig, self, damageReport) =>
-            {
-                orig(self, damageReport);
-
-                CharacterBody currentBody;
-                if (damageReport.attackerOwnerMaster != null)
-                {
-                    currentBody = damageReport.attackerOwnerMaster.GetBody();
-                }
-                else
-                {
-                    currentBody = damageReport.attackerBody;
-                }
-
-                if (!IsActiveAndEnabled() || Run.instance.isGameOverServer || damageReport.victimBody.isPlayerControlled || damageReport.attackerBody == null
-                    || damageReport.attackerBody.inventory == null || damageReport.victimBody.inventory == null || !currentBody.isPlayerControlled)
-                {
-                    return;
-                }
-
-                // TODO: Check if this logic is duplicated elsewhere, refactor into own method if so
-                if (damageReport.attackerOwnerMaster != null)
-                {
-                    if (!_playerNames.Contains(damageReport.attackerBody))
-                    {
-                        _playerNames.Add(damageReport.attackerOwnerMaster.GetBody());
-                        _counters.Add(0);
-                    }
-                }
-
-                // TODO: Think this logic is duplicated elsewhere, refactor into own method
-                if (!_playerNames.Contains(damageReport.attackerBody))
-                {
-                    _playerNames.Add(damageReport.attackerBody);
-                    _counters.Add(0);
-                }
-
-                uint pos = 0;
-
-                int enemyCountToTrigger = calculateEnemyCountToTrigger(currentBody.inventory);
-
-                // TODO: This method should be renamed to represent what it actually returns, potentially need to rename variable too
-                bool enemyTrigger = getEnemyDropRate(damageReport);
-
-                // TODO: Would be good to extract this if condition out into it's own local variable/own method with a name that describes what it is actually checking for
-                if (_counters[_playerNames.IndexOf(currentBody)] <= enemyCountToTrigger && !ArtifactOfDoomConfig.useArtifactOfSacrificeCalculation.Value)
-                {
-                    _counters[_playerNames.IndexOf(currentBody)]++;
-
-                    NetworkUser tempNetworkUser = getNetworkUserOfDamageReport(damageReport, true);
-                    // TODO: Use class instead of temp string here
-                    string temp = _counters[_playerNames.IndexOf(currentBody)] + "," + enemyCountToTrigger;
-                    ArtifactOfDoomUI.UpdateProgressBar.Invoke(temp, result =>
-                    {
-                    }, tempNetworkUser);
-
-                }
-                // TODO: The below else statement contains a nested if/else statement with a lot of logic in both parts, this should be refactored out into different methods at least
-                else
-                {
-                    CharacterBody body;
-
-                    if (damageReport.attackerOwnerMaster != null && ArtifactOfDoomConfig.useArtifactOfSacrificeCalculation.Value && !enemyTrigger)
-                    {
-                        body = damageReport.attackerOwnerMaster.GetBody();
-
-                        // TODO: Instead of multiplyinng by 100 here, just get this method to multiply any calculated value by 100 before returning the result
-                        double chanceToTrigger = getCharacterSpecificBuffLengthMultiplier(body.baseNameToken) * 100;
-                        var rand = new Random();
-                        while (chanceToTrigger > rand.Next(0, 99))
-                        {
-                            ItemIndex addedItem = GetRandomItem();
-                            body.inventory.GiveItem(addedItem);
-
-                            if (ArtifactOfDoomConfig.enableChatItemOutput.Value)
-                            {
-                                var pickupDef = ItemCatalog.GetItemDef(addedItem);
-                                var pickupName = Language.GetString(pickupDef.nameToken);
-                                var playerColor = damageReport.attackerOwnerMaster.GetBody().GetColoredUserName();
-                                var itemCount = damageReport.attackerOwnerMaster.GetBody().inventory.GetItemCount(pickupDef.itemIndex);
-                                Chat.SendBroadcastChat(new Chat.SimpleChatMessage
-                                {
-                                    baseToken =
-                                    damageReport.attackerOwnerMaster.GetBody().GetColoredUserName() + $"<color=#{_grayColor}> gained</color> " +
-                                    $"{pickupName ?? "???"} ({itemCount})</color> <color=#{_grayColor}></color>"
-                                });
-                            }
-
-                            PlayerStatsComponent.FindBodyStatSheet(body).PushStatValue(_statsGainItems, 1UL);
-                            if (!QueueGainedItemSprite.ContainsKey(body.netId.Value))
-                            {
-                                QueueGainedItemSprite.Add(body.netId.Value, new Queue<ItemDef>());
-                            }
-                            pos = body.netId.Value;
-                            QueueGainedItemSprite[pos].Enqueue(ItemCatalog.GetItemDef(addedItem));
-                            chanceToTrigger -= 100;
-                        }
-                    }
-                    else
-                    {
-                        // TODO: The only difference between the above if block code and this is the body object. This whole if else statement can be removed and the logic refactored into it's own method.
-                        body = damageReport.attackerBody;
-                        double chanceToTrigger = getCharacterSpecificItemCount(body.baseNameToken) * 100;
-                        var rand = new Random();
-                        while (chanceToTrigger > rand.Next(0, 99))
-                        {
-                            ItemIndex addedItem = GetRandomItem();
-                            body.inventory.GiveItem(addedItem);
-
-                            if (ArtifactOfDoomConfig.enableChatItemOutput.Value)
-                            {
-                                var pickupDef = ItemCatalog.GetItemDef(addedItem);
-                                var pickupName = Language.GetString(pickupDef.nameToken);
-                                var playerColor = body.GetColoredUserName();
-                                var itemCount = body.inventory.GetItemCount(pickupDef.itemIndex);
-                                Chat.SendBroadcastChat(new Chat.SimpleChatMessage
-                                {
-                                    baseToken =
-                                    body.GetColoredUserName() + $"<color=#{_grayColor}> gained</color> " +
-                                    $"{pickupName ?? "???"} ({itemCount})</color> <color=#{_grayColor}></color>"
-                                });
-                            }
-                            PlayerStatsComponent.FindBodyStatSheet(body).PushStatValue(_statsGainItems, 1UL);
-                            if (!QueueGainedItemSprite.ContainsKey(body.netId.Value))
-                            {
-                                QueueGainedItemSprite.Add(body.netId.Value, new Queue<ItemDef>());
-                            }
-                            pos = body.netId.Value;
-                            QueueGainedItemSprite[pos].Enqueue(ItemCatalog.GetItemDef(addedItem));
-                            chanceToTrigger -= 100;
-                        }
-                    }
-
-                    if (QueueGainedItemSprite[pos].Count > 10)
-                    {
-                        QueueGainedItemSprite[pos].Dequeue();
-                    }
-
-                    NetworkUser tempNetworkUser = getNetworkUserOfDamageReport(damageReport, true);
-
-                    if (!_lockItemGainNetworkUser.ContainsKey(tempNetworkUser))
-                    {
-                        _lockItemGainNetworkUser.Add(tempNetworkUser, false);
-                    }
-
-                    _counters[_playerNames.IndexOf(currentBody)]++;
-
-                    _lockItemGainNetworkUser[tempNetworkUser] = true;
-
-                    // TODO: Use a class instead of a temp string
-                    string temp = "";
-                    foreach (var element in QueueGainedItemSprite[pos])
-                    {
-                        temp += element.name + " ";
-                    }
-                    ArtifactOfDoomUI.AddGainedItemsToPlayers.Invoke(temp, result =>
-                    {
-                        _lockItemGainNetworkUser[tempNetworkUser] = false;
-                    }, tempNetworkUser);
-
-                    // TODO: Use a class instead of a temp string
-                    string tempString = _counters[_playerNames.IndexOf(currentBody)] + "," + enemyCountToTrigger;
-                    ArtifactOfDoomUI.UpdateProgressBar.Invoke(tempString, result =>
-                    {
-                    }, tempNetworkUser);
-
-                    _counters[_playerNames.IndexOf(currentBody)] = 0;
-                }
-            };
+            UnityEngine.Debug.Log(message);
         }
 
-        private void RegisterCharacterBodyOnInventoryChangedEvent()
+        private static void AddCharacterBodyToPlayerNamesList(CharacterBody self)
         {
-            On.RoR2.CharacterBody.OnInventoryChanged += (orig, self) =>
+            if (!_playerNames.Contains(self))
             {
-                orig(self);
-                try
-                {
-                    if (!IsActiveAndEnabled() || !self.isPlayerControlled)
-                    {
-                        return;
-                    }
-
-                    NetworkUser tempNetworkUser = getNetworkUserOfCharacterBody(self);
-                    int enemyCountToTrigger = calculateEnemyCountToTrigger(self.inventory);
-                    if (!_playerNames.Contains(self))
-                    {
-                        _playerNames.Add(self);
-                        _counters.Add(0);
-                    }
-
-                    if (tempNetworkUser != null)
-                    {
-                        // TODO: Instead of using a temp string here, can make a class with members for the counter index value and the enemyCountToTrigger value
-                        string tempString = _counters[_playerNames.IndexOf(self)] + "," + enemyCountToTrigger;
-                        ArtifactOfDoomUI.UpdateProgressBar.Invoke(tempString, result =>
-                        {
-                        }, tempNetworkUser);
-                    }
-                }
-                catch (Exception e)
-                {
-                    LogErrorMessage($"Error while inventory changed: \n{e}");
-                }
-            };
+                _playerNames.Add(self);
+                _counters.Add(0d);
+            }
         }
 
-        private void RegisterRunStartEvent()
+        private void HandleRpcResult(RpcResult result)
         {
-            On.RoR2.Run.Start += (orig, self) =>
+            if (result.Success)
             {
-                orig(self);
-                ArtifactOfDoomUI.IsArtifactActive.Invoke(IsActiveAndEnabled(), result =>
-                {
-                }, null);
-                ArtifactOfDoomUI.IsCalculationSacrifice.Invoke(ArtifactOfDoomConfig.useArtifactOfSacrificeCalculation.Value, result =>
-                {
-                }, null);
-            };
+                HandleSuccessRpcResult(result);
+            }
+            else
+            {
+                HandleFailedRpcResult(result);
+            }
         }
 
-        private void RegisterSceneDirectorPopulateSceneEvent()
+        private void HandleSuccessRpcResult(RpcResult result)
         {
-            On.RoR2.SceneDirector.PopulateScene += (orig, self) =>
+            switch (result.Severity)
             {
-                orig(self);
-                _currentStage = Run.instance.stageClearCount + 1;
+                case LogSeverity.Info:
+                    LogInfoMessage(result.Message);
+                    break;
+                default:
+                    break;
+            }
+        }
 
-                switch (Run.instance.selectedDifficulty)
+        private void HandleFailedRpcResult(RpcResult result)
+        {
+            switch (result.Severity)
+            {
+                case LogSeverity.Info:
+                    LogInfoMessage(result.Message);
+                    break;
+                case LogSeverity.Warning:
+                    LogWarningMessage(result.Message);
+                    break;
+                case LogSeverity.Error:
+                    LogErrorMessage(result.Message);
+                    break;
+                case LogSeverity.None:
+                default:
+                    break;
+            }
+        }
+
+        private void SendPlayerItemGainRequest(DamageReport damageReport, uint pos, bool isMasterOwner)
+        {
+            NetworkUser networkUser = GetNetworkUserOfDamageReport(damageReport, isMasterOwner);
+            SendUpdatePlayerItemsRequest(networkUser, pos, ItemChangeAction.Gain);
+        }
+
+        private void SendPlayerItemLossRequest(CharacterBody body, uint pos)
+        {
+            NetworkUser networkUser = GetNetworkUserOfCharacterBody(body);
+            SendUpdatePlayerItemsRequest(networkUser, pos, ItemChangeAction.Loss);
+        }
+
+        private void SendUpdatePlayerItemsRequest(NetworkUser networkUser, uint pos, ItemChangeAction itemChangeAction)
+        {
+            if (!_lockItemGainNetworkUser.ContainsKey(networkUser))
+            {
+                _lockItemGainNetworkUser.Add(networkUser, false);
+            }
+
+            _lockItemGainNetworkUser[networkUser] = true;
+            UpdatePlayerItemsRequest itemChangeRequest = GenerateUpdatePlayerItemsRequest(pos, itemChangeAction);
+            ArtifactOfDoomUI.UpdatePlayerItems.Invoke(itemChangeRequest, result =>
+            {
+                HandleRpcResult(result);
+
+                _lockItemGainNetworkUser[networkUser] = false;
+            }, networkUser);
+        }
+
+        private static UpdatePlayerItemsRequest GenerateUpdatePlayerItemsRequest(uint pos, ItemChangeAction itemChangeAction)
+        {
+            var itemChangeRequest = new UpdatePlayerItemsRequest(itemChangeAction);
+
+            if (itemChangeAction == ItemChangeAction.Gain)
+            {
+                foreach (var element in QueueGainedItemSprite[pos])
                 {
-                    case DifficultyIndex.Easy:
-                        _timeForBuff = ArtifactOfDoomConfig.timeAfterHitToNotLoseItemDrizzly.Value;
-                        break;
-                    case DifficultyIndex.Normal:
-                        _timeForBuff = ArtifactOfDoomConfig.timeAfterHitToNotLoseItemRainstorm.Value;
-                        break;
-                    case DifficultyIndex.Hard:
-                        _timeForBuff = ArtifactOfDoomConfig.timeAfterHitToNotLoseItemMonsoon.Value;
-                        break;
-                    default:
-                        break;
+                    itemChangeRequest.AddItem(element.name);
                 }
-                    
-                QueueLostItemSprite = new Dictionary<uint, Queue<ItemDef>>();
-                QueueGainedItemSprite = new Dictionary<uint, Queue<ItemDef>>();
-                _playerNames = new List<CharacterBody>();
-                _counters = new List<int>();
-                _lockNetworkUser.Clear();
-            };
-        }
-
-        private void RegisterGameEndReportPanelControllerAwakeEvent()
-        {
-            On.RoR2.UI.GameEndReportPanelController.Awake += (orig, self) =>
+            }
+            else if (itemChangeAction == ItemChangeAction.Loss)
             {
-                orig(self);
-                if (!IsActiveAndEnabled())
+                foreach (var element in QueueLostItemSprite[pos])
                 {
-                    return;
+                    itemChangeRequest.AddItem(element.name);
                 }
-                string[] information = new string[self.statsToDisplay.Length + 2];
-                self.statsToDisplay.CopyTo(information, 0);
-                information[information.Length - 2] = "Lostitems";
-                information[information.Length - 1] = "Gainitems";
-                self.statsToDisplay = information;
-            };
+            }
+
+            return itemChangeRequest;
         }
 
-        // TODO: Investigate refactoring this method
-        private NetworkUser getNetworkUserOfDamageReport(DamageReport report, bool withMaster)
+        private static void SendItemChatMessage(CharacterBody currentBody, ItemIndex addedItem, ItemChangeAction itemChangeAction)
+        {
+            var pickupDef = ItemCatalog.GetItemDef(addedItem);
+            var pickupName = Language.GetString(pickupDef.nameToken);
+            var playerColor = currentBody.GetColoredUserName();
+            var itemCount = currentBody.inventory.GetItemCount(pickupDef.itemIndex);
+            var itemAction = itemChangeAction == ItemChangeAction.Gain ? "gained" : "lost";
+            Chat.SendBroadcastChat(new Chat.SimpleChatMessage
+            {
+                baseToken =
+                playerColor + $"<color=#{_grayColor}> {itemAction}</color> " +
+                $"{pickupName ?? "???"} ({itemCount})</color> <color=#{_grayColor}></color>"
+            });
+        }
+
+        private void SendUpdateProgressBarRequest(DamageReport damageReport, CharacterBody currentBody, double enemyCountToTrigger)
+        {
+            _counters[_playerNames.IndexOf(currentBody)]++;
+
+            NetworkUser networkUser = GetNetworkUserOfDamageReport(damageReport, true);
+            if (!_lockNetworkUser.ContainsKey(networkUser))
+            {
+                _lockNetworkUser.Add(networkUser, false);
+            }
+
+            if (_lockNetworkUser[networkUser] == false)
+            {
+                _lockNetworkUser[networkUser] = true;
+                var request = new UpdateProgressBarRequest(_counters[_playerNames.IndexOf(currentBody)], enemyCountToTrigger);
+                ArtifactOfDoomUI.UpdateProgressBar.Invoke(request, result =>
+                {
+                    HandleRpcResult(result);
+
+                    _lockNetworkUser[networkUser] = false;
+                }, networkUser);
+            }
+        }
+
+        private NetworkUser GetNetworkUserOfDamageReport(DamageReport report, bool withMaster)
         {
             NetworkUser tempNetworkUser = null;
             foreach (var element in NetworkUser.readOnlyInstancesList)
@@ -576,8 +607,7 @@ namespace ArtifactOfDoom
             return tempNetworkUser;
         }
 
-        // TODO: Investigate refactoring this method
-        private NetworkUser getNetworkUserOfCharacterBody(CharacterBody body)
+        private NetworkUser GetNetworkUserOfCharacterBody(CharacterBody body)
         {
             NetworkUser tempNetworkUser = null;
             foreach (var element in NetworkUser.readOnlyInstancesList)
@@ -591,142 +621,141 @@ namespace ArtifactOfDoom
             return tempNetworkUser;
         }
 
-        // TODO: Investigate refactoring this method
-        private int getTotalItemCountOfPlayer(Inventory inventory)
+        private int GetTotalItemCountOfPlayer(Inventory inventory)
         {
             return inventory.GetTotalItemCountOfTier(ItemTier.Tier1) +
             inventory.GetTotalItemCountOfTier(ItemTier.Tier2) +
             inventory.GetTotalItemCountOfTier(ItemTier.Tier3);
         }
 
-        // TODO: Investigate refactoring this method
-        private int calculateEnemyCountToTrigger(Inventory inventory)
+        private double CalculateEnemyCountToTrigger(Inventory inventory)
         {
-            var totalItems = getTotalItemCountOfPlayer(inventory);
+            var totalItems = GetTotalItemCountOfPlayer(inventory);
             var calculatedValue = totalItems - _currentStage * ArtifactOfDoomConfig.averageItemsPerStage.Value;
-            int calculatesEnemyCountToTrigger = 0;
+            double calculatedEnemyCountToTrigger;
             if (calculatedValue >= 0)
-                calculatesEnemyCountToTrigger = (int)Math.Pow(calculatedValue, ArtifactOfDoomConfig.exponentTriggerItems.Value);
+            {
+                calculatedEnemyCountToTrigger = Math.Pow(calculatedValue, ArtifactOfDoomConfig.exponentTriggerItems.Value);
+            }
             else
-                calculatesEnemyCountToTrigger = (int)Math.Pow(totalItems, ArtifactOfDoomConfig.exponentailFactorIfYouAreUnderAverageItemsPerStage.Value);
-            //calculatesEnemyCountToTrigger =1;
+            {
+                calculatedEnemyCountToTrigger = Math.Pow(totalItems, ArtifactOfDoomConfig.exponentailFactorIfYouAreUnderAverageItemsPerStage.Value);
+            }
 
-            if (calculatesEnemyCountToTrigger < 1)
-                calculatesEnemyCountToTrigger = 1;
+            if (calculatedEnemyCountToTrigger < 1)
+            {
+                calculatedEnemyCountToTrigger = 1;
+            }
 
             if (RunArtifactManager.instance.IsArtifactEnabled(RoR2Content.Artifacts.swarmsArtifactDef) && ArtifactOfDoomConfig.artifactOfSwarmNerf.Value)
-                calculatesEnemyCountToTrigger *= 2;
-            return calculatesEnemyCountToTrigger;
+            {
+                calculatedEnemyCountToTrigger *= 2;
+            }
+
+            return calculatedEnemyCountToTrigger + 2;
         }
 
-        // TODO: Investigate refactoring this method
-        private double getCharacterSpecificItemCount(string baseNameToken)
+        private double GetCharacterSpecificItemCount(string baseNameToken)
         {
             switch (baseNameToken)
             {
                 case "COMMANDO_BODY_NAME":
-                    if (Debug) { UnityEngine.Debug.LogWarning($"Character baseNameToken = {baseNameToken} returning: Commando"); }
+                    LogWarningMessage($"Character baseNameToken = {baseNameToken} returning: Commando"); 
                     return ArtifactOfDoomConfig.CommandoBonusItems.Value;
                 case "HUNTRESS_BODY_NAME":
-                    if (Debug) { UnityEngine.Debug.LogWarning($"Character baseNameToken = {baseNameToken} returning: Huntress"); }
+                    LogWarningMessage($"Character baseNameToken = {baseNameToken} returning: Huntress"); 
                     return ArtifactOfDoomConfig.HuntressBonusItems.Value;
                 case "ENGI_BODY_NAME":
-                    if (Debug) { UnityEngine.Debug.LogWarning($"Character baseNameToken = {baseNameToken} returning: Engineer"); }
+                    LogWarningMessage($"Character baseNameToken = {baseNameToken} returning: Engineer"); 
                     return ArtifactOfDoomConfig.EngineerBonusItems.Value;
                 case "TOOLBOT_BODY_NAME":
-                    if (Debug) { UnityEngine.Debug.LogWarning($"Character baseNameToken = {baseNameToken} returning: MULT"); }
+                    LogWarningMessage($"Character baseNameToken = {baseNameToken} returning: MULT"); 
                     return ArtifactOfDoomConfig.MULTBonusItems.Value;
                 case "MAGE_BODY_NAME":
-                    if (Debug) { UnityEngine.Debug.LogWarning($"Character baseNameToken = {baseNameToken} returning: Artificer"); }
+                    LogWarningMessage($"Character baseNameToken = {baseNameToken} returning: Artificer"); 
                     return ArtifactOfDoomConfig.ArtificerBonusItems.Value;
                 case "MERC_BODY_NAME":
-                    if (Debug) { UnityEngine.Debug.LogWarning($"Character baseNameToken = {baseNameToken} returning: Mercenary"); }
+                    LogWarningMessage($"Character baseNameToken = {baseNameToken} returning: Mercenary"); 
                     return ArtifactOfDoomConfig.MercenaryBonusItems.Value;
                 case "TREEBOT_BODY_NAME":
-                    if (Debug) { UnityEngine.Debug.LogWarning($"Character baseNameToken = {baseNameToken} returning: Rex"); }
+                    LogWarningMessage($"Character baseNameToken = {baseNameToken} returning: Rex"); 
                     return ArtifactOfDoomConfig.RexBonusItems.Value;
                 case "LOADER_BODY_NAME":
-                    if (Debug) { UnityEngine.Debug.LogWarning($"Character baseNameToken = {baseNameToken} returning: Loader"); }
+                    LogWarningMessage($"Character baseNameToken = {baseNameToken} returning: Loader"); 
                     return ArtifactOfDoomConfig.LoaderBonusItems.Value;
                 case "CROCO_BODY_NAME":
-                    if (Debug) { UnityEngine.Debug.LogWarning($"Character baseNameToken = {baseNameToken} returning: Acrid"); }
+                    LogWarningMessage($"Character baseNameToken = {baseNameToken} returning: Acrid"); 
                     return ArtifactOfDoomConfig.AcridBonusItems.Value;
                 case "CAPTAIN_BODY_NAME":
-                    if (Debug) { UnityEngine.Debug.LogWarning($"Character baseNameToken = {baseNameToken} returning: Acrid"); }
+                    LogWarningMessage($"Character baseNameToken = {baseNameToken} returning: Captain"); 
                     return ArtifactOfDoomConfig.CaptainBonusItems.Value;
                 default:
                     string CustomChars = ArtifactOfDoomConfig.CustomChars.Value;
-
-                    //Character characters = TinyJson.JSONParser.FromJson<Character>(CustomChars);
                     List<Character> characters=CustomChars.FromJson<List<Character>>();
                     foreach(var element in characters)
                     {
-                        if(baseNameToken == element.Name)
-                        return element.BonusItems;
+                        if (baseNameToken == element.Name)
+                        {
+                            LogWarningMessage($"Character baseNameToken = {baseNameToken} returning: CustomChar MultiplierForTimedBuff");
+                            return element.BonusItems;
+                        }
                     }
                     UnityEngine.Debug.LogWarning("did not find a valid configuation setting for Character " + baseNameToken + " you can add one in the settings");
-                    if (Debug) { UnityEngine.Debug.LogWarning($"Character baseNameToken = {baseNameToken} returning: Acrid"); }
+                    LogWarningMessage($"Character baseNameToken = {baseNameToken} returning: CustomSurvivorBonusItems");
                     return ArtifactOfDoomConfig.CustomSurvivorBonusItems.Value;
             }
         }
 
-        // TODO: Investigate refactoring this method
-        private double getCharacterSpecificBuffLengthMultiplier(string baseNameToken)
+        private double GetCharacterSpecificBuffLengthMultiplier(string baseNameToken)
         {
             switch (baseNameToken)
             {
                 case "COMMANDO_BODY_NAME":
-                    if (Debug) { UnityEngine.Debug.LogWarning($"Character baseNameToken = {baseNameToken} returning: Commando"); }
+                    LogWarningMessage($"Character baseNameToken = {baseNameToken} returning: Commando");
                     return ArtifactOfDoomConfig.CommandoMultiplierForTimedBuff.Value;
                 case "HUNTRESS_BODY_NAME":
-                    if (Debug) { UnityEngine.Debug.LogWarning($"Character baseNameToken = {baseNameToken} returning: Huntress"); }
+                    LogWarningMessage($"Character baseNameToken = {baseNameToken} returning: Huntress");
                     return ArtifactOfDoomConfig.HuntressMultiplierForTimedBuff.Value;
                 case "ENGI_BODY_NAME":
-                    if (Debug) { UnityEngine.Debug.LogWarning($"Character baseNameToken = {baseNameToken} returning: Engineer"); }
+                    LogWarningMessage($"Character baseNameToken = {baseNameToken} returning: Engineer");
                     return ArtifactOfDoomConfig.EngineerMultiplierForTimedBuff.Value;
                 case "TOOLBOT_BODY_NAME":
-                    if (Debug) { UnityEngine.Debug.LogWarning($"Character baseNameToken = {baseNameToken} returning: MULT"); }
+                    LogWarningMessage($"Character baseNameToken = {baseNameToken} returning: MULT");
                     return ArtifactOfDoomConfig.MULTMultiplierForTimedBuff.Value;
                 case "MAGE_BODY_NAME":
-                    if (Debug) { UnityEngine.Debug.LogWarning($"Character baseNameToken = {baseNameToken} returning: Artificer"); }
+                    LogWarningMessage($"Character baseNameToken = {baseNameToken} returning: Artificer");
                     return ArtifactOfDoomConfig.ArtificerMultiplierForTimedBuff.Value;
                 case "MERC_BODY_NAME":
-                    if (Debug) { UnityEngine.Debug.LogWarning($"Character baseNameToken = {baseNameToken} returning: Mercenary"); }
+                    LogWarningMessage($"Character baseNameToken = {baseNameToken} returning: Mercenary");
                     return ArtifactOfDoomConfig.MercenaryMultiplierForTimedBuff.Value;
                 case "TREEBOT_BODY_NAME":
-                    if (Debug) { UnityEngine.Debug.LogWarning($"Character baseNameToken = {baseNameToken} returning: Rex"); }
+                    LogWarningMessage($"Character baseNameToken = {baseNameToken} returning: Rex");
                     return ArtifactOfDoomConfig.RexMultiplierForTimedBuff.Value;
                 case "LOADER_BODY_NAME":
-                    if (Debug) { UnityEngine.Debug.LogWarning($"Character baseNameToken = {baseNameToken} returning: Loader"); }
+                    LogWarningMessage($"Character baseNameToken = {baseNameToken} returning: Loader");
                     return ArtifactOfDoomConfig.LoaderMultiplierForTimedBuff.Value;
                 case "CROCO_BODY_NAME":
-                    if (Debug) { UnityEngine.Debug.LogWarning($"Character baseNameToken = {baseNameToken} returning: Acrid"); }
+                    LogWarningMessage($"Character baseNameToken = {baseNameToken} returning: Acrid");
                     return ArtifactOfDoomConfig.AcridMultiplierForTimedBuff.Value;
                 case "CAPTAIN_BODY_NAME":
-                    if (Debug) { UnityEngine.Debug.LogWarning($"Character baseNameToken = {baseNameToken} returning: Acrid"); }
+                    LogWarningMessage($"Character baseNameToken = {baseNameToken} returning: Captain");
                     return ArtifactOfDoomConfig.CaptainMultiplierForTimedBuff.Value;
                 default:
                     string CustomChars = ArtifactOfDoomConfig.CustomChars.Value;
-
-                    //Character characters = TinyJson.JSONParser.FromJson<Character>(CustomChars);
                     List<Character> characters=CustomChars.FromJson<List<Character>>();
                     foreach(var element in characters)
                     {
-                        if(baseNameToken == element.Name)
-                        return element.MultiplierForTimedBuff;
+                        if (baseNameToken == element.Name)
+                        {
+                            LogWarningMessage($"Character baseNameToken = {baseNameToken} returning: CustomChar MultiplierForTimedBuff");
+                            return element.MultiplierForTimedBuff;
+                        }
                     }
                     UnityEngine.Debug.LogWarning("did not find a valid configuation setting for Character " + baseNameToken + " you can add one in the settings");
-                    if (Debug) { UnityEngine.Debug.LogWarning($"Character baseNameToken = {baseNameToken} returning: Acrid"); }
+                    LogWarningMessage($"Character baseNameToken = {baseNameToken} returning: CustomSurvivorMultiplierForTimedBuff");
                     return ArtifactOfDoomConfig.CustomSurvivorMultiplierForTimedBuff.Value;
             }
-        }
-
-        public class Character
-        {
-            public string Name { get; set; }
-            public float MultiplierForTimedBuff { get; set; }
-            public float BonusItems { get; set; }
-        }
+        }        
 
         public ItemIndex GetRandomItem()
         {
@@ -752,28 +781,19 @@ namespace ArtifactOfDoom
             _statsLostItems = null;
             _statsGainItems = null;
             _playerNames = new List<CharacterBody>();
-            _counters = new List<int>();
+            _counters = new List<double>();
         }
 
-        // TODO: Refactor this method - name at least
-        private bool getEnemyDropRate(DamageReport damageReport)
+        private bool IsItemGivenFromArtifactOfSacrifice(DamageReport damageReport)
         {
-            if (!ArtifactOfDoomConfig.useArtifactOfSacrificeCalculation.Value)
-                return false;
-            if (!damageReport.victimMaster)
+            if (!ArtifactOfDoomConfig.useArtifactOfSacrificeCalculation.Value || !damageReport.victimMaster 
+                || (damageReport.attackerTeamIndex == damageReport.victimTeamIndex && damageReport.victimMaster.minionOwnership.ownerMaster))
             {
                 return false;
             }
-            if (damageReport.attackerTeamIndex == damageReport.victimTeamIndex && damageReport.victimMaster.minionOwnership.ownerMaster)
-            {
-                return false;
-            }
-            float expAdjustedDropChancePercent = Util.GetExpAdjustedDropChancePercent(5f * (float)ArtifactOfDoomConfig.multiplayerForArtifactOfSacrificeDropRate.Value, damageReport.victim.gameObject);
-            //Debug.LogFormat("Drop chance from {0}: {1}", new object[]
-            //{
-            //	damageReport.victimBody,
-            //	expAdjustedDropChancePercent
-            //});
+            
+            float expAdjustedDropChancePercent = Util.GetExpAdjustedDropChancePercent(_baseDropChance, damageReport.victim.gameObject);
+            
             if (Util.CheckRoll(expAdjustedDropChancePercent, 0f, null))
             {
                 return true;
